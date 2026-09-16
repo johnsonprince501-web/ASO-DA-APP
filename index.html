@@ -239,26 +239,44 @@
 </div>
 </div>
 
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 <script>
-// Compatibility shim: replaces the Claude-Artifacts-only window.storage
-// with the browser's built-in localStorage, so this works as a normal website.
+// Firebase setup: this makes members/contributions/donations/etc and the
+// admin password shared across every device and every visitor.
+const firebaseConfig = {
+  apiKey: "AIzaSyDNkDg9Hqs1akMRrSCG07fE1qL1dp77H2Y",
+  authDomain: "aso-da-app.firebaseapp.com",
+  projectId: "aso-da-app",
+  storageBucket: "aso-da-app.firebasestorage.app",
+  messagingSenderId: "539053179502",
+  appId: "1:539053179502:web:ca92891d993da927fb9c7f"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+
+// window.storage shim, now backed by Firestore instead of localStorage,
+// so data is shared across every device/browser that opens this site.
 window.storage = {
   async get(key, shared){
-    const raw = localStorage.getItem(key);
-    if(raw === null) return null;
-    return { key, value: raw, shared: !!shared };
+    try{
+      const doc = await db.collection('app_data').doc(key).get();
+      if(!doc.exists) return null;
+      return { key, value: doc.data().value, shared: true };
+    }catch(e){ console.error('storage.get failed', e); return null; }
   },
   async set(key, value, shared){
-    localStorage.setItem(key, value);
-    return { key, value, shared: !!shared };
+    await db.collection('app_data').doc(key).set({ value });
+    return { key, value, shared: true };
   },
   async delete(key, shared){
-    localStorage.removeItem(key);
-    return { key, deleted: true, shared: !!shared };
+    await db.collection('app_data').doc(key).delete();
+    return { key, deleted: true, shared: true };
   },
   async list(prefix, shared){
-    const keys = Object.keys(localStorage).filter(k => !prefix || k.startsWith(prefix));
-    return { keys, prefix, shared: !!shared };
+    const snap = await db.collection('app_data').get();
+    const keys = snap.docs.map(d=>d.id).filter(k => !prefix || k.startsWith(prefix));
+    return { keys, prefix, shared: true };
   }
 };
 
