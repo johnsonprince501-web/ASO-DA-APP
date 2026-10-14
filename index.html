@@ -96,8 +96,11 @@
   .lockscreen .showpass input{width:auto; margin:0;}
   .lockscreen button{width:100%; padding:11px; margin-top:4px;}
   .lockscreen .error{text-align:left; margin-top:6px;}
+  .lockscreen .info{color:var(--green); font-size:13px; text-align:left; margin-top:8px;}
+  .lockscreen .linkbtn{background:none; border:none; color:var(--green); text-decoration:underline; font-size:13px; cursor:pointer; padding:6px; margin-top:8px; width:auto;}
   #appRoot{display:none;}
-  .logout-bar{display:flex; justify-content:flex-end; margin-bottom:8px;}
+  .logout-bar{display:flex; justify-content:flex-end; align-items:center; gap:12px; margin-bottom:8px;}
+  .logout-bar span{font-size:13px; color:var(--ink-dim);}
   .logout-bar button{background:none; border:none; color:var(--ink-dim); font-size:13px; cursor:pointer; text-decoration:underline;}
 
   .banner{
@@ -110,18 +113,22 @@
 <body>
 
 <div id="lockscreen" class="lockscreen">
-  <h2 id="lockTitle">Connecting…</h2>
+  <h2 id="lockTitle">Loading…</h2>
   <p id="lockSub">Please wait a moment.</p>
-  <input id="lockPass" type="password" placeholder="Password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" style="display:none;">
-  <input id="lockPass2" type="password" placeholder="Confirm password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" style="display:none;">
-  <label class="showpass" id="showPassRow" style="display:none;"><input type="checkbox" id="showPass" onchange="toggleShowPass()"> Show password</label>
-  <button class="primary" id="lockBtn" disabled>Please wait</button>
+  <div id="loginForm" style="display:none;">
+    <input id="lockEmail" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <input id="lockPass" type="password" placeholder="Password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <label class="showpass"><input type="checkbox" id="showPass" onchange="toggleShowPass()"> Show password</label>
+    <button class="primary" id="lockBtn">Sign in</button>
+    <button class="linkbtn" id="forgotBtn" type="button">Forgot password?</button>
+  </div>
   <div id="lockError" class="error"></div>
+  <div id="lockInfo" class="info"></div>
 </div>
 
 <div id="appRoot">
 <div class="app">
-  <div class="logout-bar"><button onclick="logout()">Lock app</button></div>
+  <div class="logout-bar"><span id="whoami"></span><button onclick="logout()">Sign out</button></div>
   <h1>Angwa Shanu, Ojepio Sons and Daughters Development Association</h1>
   <p class="sub">Ojoku Ojeje, Anpka, Kogi State — members, contributions, launching pledges and donations in one place.</p>
 
@@ -256,6 +263,7 @@
 
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
 <script>
 // Firebase setup: this makes members/contributions/donations/etc and the
 // admin password shared across every device and every visitor.
@@ -272,7 +280,7 @@ const db = firebase.firestore();
 
 // Storage helper backed by Firestore. Errors are NOT swallowed here:
 // callers must handle a failed read so a bad connection is never mistaken
-// for "no password set" or "no records yet".
+// for "no records yet".
 window.storage = {
   async get(key){
     const doc = await db.collection('app_data').doc(key).get();
@@ -296,146 +304,105 @@ function esc(s){
   ));
 }
 
-/* ---------- Password lock ---------- */
+/* ---------- Sign-in (Firebase Authentication) ---------- */
 
-let lockMode = 'login'; // 'login' | 'setup' | 'offline'
-
-async function sha256(text){
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
-}
-
-async function readAuth(){
-  const res = await window.storage.get('association-auth');
-  return (res && res.value) ? JSON.parse(res.value) : null;
-}
+const auth = firebase.auth();
 
 function toggleShowPass(){
-  const type = document.getElementById('showPass').checked ? 'text' : 'password';
-  document.getElementById('lockPass').type = type;
-  document.getElementById('lockPass2').type = type;
+  document.getElementById('lockPass').type = document.getElementById('showPass').checked ? 'text' : 'password';
 }
 
-function setLockView(mode){
-  lockMode = mode;
-  const title = document.getElementById('lockTitle');
-  const sub = document.getElementById('lockSub');
-  const pass = document.getElementById('lockPass');
-  const pass2 = document.getElementById('lockPass2');
-  const showRow = document.getElementById('showPassRow');
-  const btn = document.getElementById('lockBtn');
-  btn.disabled = false;
+function showLoginForm(){
+  document.getElementById('lockTitle').textContent = 'Sign in';
+  document.getElementById('lockSub').textContent = 'For association officers. Use the email and password created for you.';
+  document.getElementById('loginForm').style.display = 'block';
+  document.getElementById('lockscreen').style.display = 'block';
+  document.getElementById('appRoot').style.display = 'none';
+}
 
-  if(mode === 'offline'){
-    title.textContent = "Can't connect";
-    sub.textContent = 'Check your internet connection and try again. Your password and records are safe.';
-    pass.style.display = 'none'; pass2.style.display = 'none'; showRow.style.display = 'none';
-    btn.textContent = 'Try again';
-  } else if(mode === 'setup'){
-    title.textContent = 'Set an admin password';
-    sub.textContent = 'This is the first time opening this app — choose a password everyone with access will use.';
-    pass.style.display = 'block'; pass2.style.display = 'block'; showRow.style.display = 'flex';
-    pass.autocomplete = 'new-password';
-    btn.textContent = 'Set password';
-  } else {
-    title.textContent = 'Enter password';
-    sub.textContent = 'This app is password-protected.';
-    pass.style.display = 'block'; pass2.style.display = 'none'; showRow.style.display = 'flex';
-    pass.autocomplete = 'current-password';
-    btn.textContent = 'Unlock';
+function authMessage(e){
+  switch(e && e.code){
+    case 'auth/invalid-credential':
+    case 'auth/invalid-login-credentials':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+      return 'Incorrect email or password. Check for extra spaces.';
+    case 'auth/invalid-email':
+      return 'That email address does not look right.';
+    case 'auth/too-many-requests':
+      return 'Too many attempts. Wait a few minutes, or tap "Forgot password?".';
+    case 'auth/network-request-failed':
+      return "Can't connect. Check your internet and try again.";
+    case 'auth/operation-not-allowed':
+      return 'Email sign-in is not switched on in Firebase yet.';
+    case 'auth/user-disabled':
+      return 'This account has been disabled.';
+    default:
+      return 'Could not sign in. Please try again.';
   }
 }
 
-async function initLock(){
-  const btn = document.getElementById('lockBtn');
+async function handleSignIn(){
   const err = document.getElementById('lockError');
-  err.textContent = '';
-  btn.disabled = true;
-  btn.textContent = 'Connecting…';
-  try{
-    const rec = await readAuth();
-    setLockView(rec ? 'login' : 'setup');
-  }catch(e){
-    console.error('Could not read password record', e);
-    setLockView('offline');
-  }
-}
-
-async function handleLockSubmit(){
-  const err = document.getElementById('lockError');
+  const info = document.getElementById('lockInfo');
   const btn = document.getElementById('lockBtn');
-  err.textContent = '';
-
-  if(lockMode === 'offline'){ initLock(); return; }
-
+  err.textContent = ''; info.textContent = '';
+  const email = document.getElementById('lockEmail').value.trim();
   const pass = document.getElementById('lockPass').value;
-  if(!pass){ err.textContent = 'Enter a password'; return; }
-
+  if(!email || !pass){ err.textContent = 'Enter your email and password'; return; }
   btn.disabled = true;
   try{
-    if(lockMode === 'setup'){
-      const pass2 = document.getElementById('lockPass2').value;
-      if(pass.length < 4){ err.textContent = 'Use at least 4 characters'; return; }
-      if(pass !== pass2){ err.textContent = 'Passwords do not match'; return; }
-
-      // Safety check: never overwrite a password that already exists.
-      let existing;
-      try{ existing = await readAuth(); }
-      catch(e){ err.textContent = "Can't connect right now. Check your internet and try again."; return; }
-      if(existing){
-        err.textContent = 'A password has already been set. Reloading…';
-        setTimeout(()=>location.reload(), 1200);
-        return;
-      }
-
-      const hash = await sha256(pass);
-      try{
-        await window.storage.set('association-auth', JSON.stringify({ hash }));
-      }catch(e){
-        console.error(e);
-        err.textContent = 'Could not save the password. Check your internet connection and try again.';
-        return;
-      }
-      unlockApp();
-    } else {
-      let rec;
-      try{ rec = await readAuth(); }
-      catch(e){ err.textContent = "Can't connect right now. Check your internet and try again."; return; }
-      if(!rec){ initLock(); return; }
-      const hash = await sha256(pass);
-      if(rec.hash === hash){
-        unlockApp();
-      } else {
-        err.textContent = 'Incorrect password. Check for extra spaces or capital letters.';
-      }
-    }
-  } finally {
+    await auth.signInWithEmailAndPassword(email, pass);
+  }catch(e){
+    console.error(e);
+    err.textContent = authMessage(e);
+  }finally{
     btn.disabled = false;
   }
 }
 
-document.getElementById('lockBtn').onclick = handleLockSubmit;
-['lockPass','lockPass2'].forEach(id=>{
+async function handleForgot(){
+  const err = document.getElementById('lockError');
+  const info = document.getElementById('lockInfo');
+  err.textContent = ''; info.textContent = '';
+  const email = document.getElementById('lockEmail').value.trim();
+  if(!email){ err.textContent = 'Type your email in the box above first, then tap "Forgot password?".'; return; }
+  const sentMsg = 'If that email belongs to an officer account, a reset link is on its way. Check your inbox and spam folder.';
+  try{
+    await auth.sendPasswordResetEmail(email);
+    info.textContent = sentMsg;
+  }catch(e){
+    if(e && e.code === 'auth/user-not-found'){ info.textContent = sentMsg; }
+    else { err.textContent = authMessage(e); }
+  }
+}
+
+function logout(){ auth.signOut(); }
+
+document.getElementById('lockBtn').onclick = handleSignIn;
+document.getElementById('forgotBtn').onclick = handleForgot;
+['lockEmail','lockPass'].forEach(id=>{
   document.getElementById(id).addEventListener('keydown', e=>{
-    if(e.key === 'Enter') handleLockSubmit();
+    if(e.key === 'Enter') handleSignIn();
   });
 });
 
-function unlockApp(){
-  document.getElementById('lockscreen').style.display = 'none';
-  document.getElementById('appRoot').style.display = 'block';
-  document.getElementById('lockPass').value = '';
-  document.getElementById('lockPass2').value = '';
-  if(!loaded) loadData();
-}
-
-function logout(){
-  document.getElementById('appRoot').style.display = 'none';
-  document.getElementById('lockscreen').style.display = 'block';
-  document.getElementById('showPass').checked = false;
-  toggleShowPass();
-  initLock();
-}
+auth.onAuthStateChanged(user => {
+  if(user){
+    document.getElementById('whoami').textContent = user.email || '';
+    document.getElementById('lockscreen').style.display = 'none';
+    document.getElementById('appRoot').style.display = 'block';
+    document.getElementById('lockPass').value = '';
+    if(!loaded) loadData();
+  } else {
+    // Clear records from memory so nothing lingers on screen after signing out.
+    data = { members: [], contributions: [], launching: [], donations: [], meetings: [] };
+    loaded = false; loadFailed = false;
+    showBanner('');
+    renderAll();
+    showLoginForm();
+  }
+});
 
 /* ---------- Loading and saving records ---------- */
 
@@ -455,7 +422,11 @@ async function loadData(){
   }catch(e){
     console.error('Load failed', e);
     loadFailed = true;
-    showBanner("Couldn't load your saved records. Nothing will be saved until this is fixed, so please don't add anything yet.");
+    if(e && e.code === 'permission-denied'){
+      showBanner("This account is not authorised to view the records. Ask the association administrator to add your account.");
+    } else {
+      showBanner("Couldn't load your saved records. Nothing will be saved until this is fixed, so please don't add anything yet.");
+    }
   }
   ['members','contributions','launching','donations','meetings'].forEach(k=>{ if(!Array.isArray(data[k])) data[k] = []; });
   loaded = !loadFailed;
@@ -756,7 +727,6 @@ function renderAll(){
   renderMeetings();
 }
 
-initLock();
 </script>
 </body>
 </html>
