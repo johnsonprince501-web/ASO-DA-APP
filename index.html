@@ -115,6 +115,7 @@
 <div id="lockscreen" class="lockscreen">
   <h2 id="lockTitle">Loading…</h2>
   <p id="lockSub">Please wait a moment.</p>
+  <button class="linkbtn" id="reloadBtn" type="button" style="display:none;" onclick="location.reload()">Reload page</button>
   <div id="loginForm" style="display:none;">
     <input id="lockEmail" type="email" placeholder="Email" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false">
     <input id="lockPass" type="password" placeholder="Password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false">
@@ -262,8 +263,11 @@
 </div>
 
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script>window.firebase || document.write('<script src="https://cdn.jsdelivr.net/npm/firebase@10.7.1/firebase-app-compat.js"><\/script>');</script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+<script>(window.firebase && firebase.firestore) || document.write('<script src="https://cdn.jsdelivr.net/npm/firebase@10.7.1/firebase-firestore-compat.js"><\/script>');</script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+<script>(window.firebase && firebase.auth) || document.write('<script src="https://cdn.jsdelivr.net/npm/firebase@10.7.1/firebase-auth-compat.js"><\/script>');</script>
 <script>
 // Firebase setup: this makes members/contributions/donations/etc and the
 // admin password shared across every device and every visitor.
@@ -275,19 +279,24 @@ const firebaseConfig = {
   messagingSenderId: "539053179502",
   appId: "1:539053179502:web:ca92891d993da927fb9c7f"
 };
-firebase.initializeApp(firebaseConfig);
-const db = firebase.firestore();
+let db = null;
+try{
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.firestore();
+}catch(e){ console.error('Firebase failed to start', e); }
 
 // Storage helper backed by Firestore. Errors are NOT swallowed here:
 // callers must handle a failed read so a bad connection is never mistaken
 // for "no records yet".
 window.storage = {
   async get(key){
+    if(!db) throw new Error('Database not available');
     const doc = await db.collection('app_data').doc(key).get();
     if(!doc.exists) return null;
     return { key, value: doc.data().value };
   },
   async set(key, value){
+    if(!db) throw new Error('Database not available');
     await db.collection('app_data').doc(key).set({ value });
     return { key, value };
   }
@@ -306,7 +315,20 @@ function esc(s){
 
 /* ---------- Sign-in (Firebase Authentication) ---------- */
 
-const auth = firebase.auth();
+let auth = null;
+let authReady = false;
+try{ auth = firebase.auth(); }catch(e){ console.error('Auth failed to start', e); }
+
+// If sign-in never finishes loading, say so instead of sitting on "Loading..." forever.
+function showLoadProblem(msg){
+  if(authReady) return;
+  document.getElementById('lockTitle').textContent = 'Having trouble loading';
+  if(typeof firebase === 'undefined'){
+    msg = "The Firebase service could not be loaded, so sign-in can't start. Your phone or network may be blocking it. Turn off any ad blocker, data saver or VPN, open this page in Chrome, and tap Reload. If it still fails, try a different network (for example mobile data instead of Wi-Fi).";
+  }
+  document.getElementById('lockSub').textContent = msg;
+  document.getElementById('reloadBtn').style.display = 'inline-block';
+}
 
 function toggleShowPass(){
   document.getElementById('lockPass').type = document.getElementById('showPass').checked ? 'text' : 'password';
@@ -387,22 +409,32 @@ document.getElementById('forgotBtn').onclick = handleForgot;
   });
 });
 
-auth.onAuthStateChanged(user => {
-  if(user){
-    document.getElementById('whoami').textContent = user.email || '';
-    document.getElementById('lockscreen').style.display = 'none';
-    document.getElementById('appRoot').style.display = 'block';
-    document.getElementById('lockPass').value = '';
-    if(!loaded) loadData();
-  } else {
-    // Clear records from memory so nothing lingers on screen after signing out.
-    data = { members: [], contributions: [], launching: [], donations: [], meetings: [] };
-    loaded = false; loadFailed = false;
-    showBanner('');
-    renderAll();
-    showLoginForm();
-  }
-});
+if(auth){
+  auth.onAuthStateChanged(user => {
+    authReady = true;
+    document.getElementById('reloadBtn').style.display = 'none';
+    if(user){
+      document.getElementById('whoami').textContent = user.email || '';
+      document.getElementById('lockscreen').style.display = 'none';
+      document.getElementById('appRoot').style.display = 'block';
+      document.getElementById('lockPass').value = '';
+      if(!loaded) loadData();
+    } else {
+      // Show the sign-in form first, then clear any records left in memory.
+      showLoginForm();
+      data = { members: [], contributions: [], launching: [], donations: [], meetings: [] };
+      loaded = false; loadFailed = false;
+      showBanner('');
+      try{ renderAll(); }catch(e){ console.error(e); }
+    }
+  }, e => {
+    console.error('Auth state error', e);
+    showLoadProblem('The sign-in service could not start. Try opening this page in Chrome, and turn off private browsing.');
+  });
+  setTimeout(() => showLoadProblem('This is taking longer than usual. Check your internet connection. If you opened the link inside WhatsApp or Facebook, open it in Chrome instead.'), 8000);
+} else {
+  showLoadProblem('The sign-in service could not load. Check your internet connection, turn off any ad blocker, and try again.');
+}
 
 /* ---------- Loading and saving records ---------- */
 
