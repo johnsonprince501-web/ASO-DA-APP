@@ -455,7 +455,9 @@ async function loadData(){
     console.error('Load failed', e);
     loadFailed = true;
     if(e && e.code === 'permission-denied'){
-      showBanner("This account is not authorised to view the records. Ask the association administrator to add your account.");
+      const u = auth && auth.currentUser;
+      const who = u ? " You are signed in as " + (u.email || "unknown") + " (UID: " + u.uid + ")." : "";
+      showBanner("This account is not authorised to view the records." + who + " The database rules must list exactly this email or UID.");
     } else {
       showBanner("Couldn't load your saved records. Nothing will be saved until this is fixed, so please don't add anything yet.");
     }
