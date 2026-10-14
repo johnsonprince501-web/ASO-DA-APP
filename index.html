@@ -63,6 +63,7 @@
     color:#fff; font-size:14px; font-weight:500; cursor:pointer;
   }
   button.primary:hover{background:#345a3d;}
+  button.primary:disabled{opacity:0.6; cursor:default;}
   .error{color:var(--clay); font-size:12.5px; margin-top:4px;}
 
   table{width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden;}
@@ -88,21 +89,33 @@
     width:100%; padding:11px 12px; border:1px solid var(--line); border-radius:6px;
     font-size:14px; margin-bottom:10px; font-family:inherit;
   }
+  .lockscreen .showpass{
+    display:flex; align-items:center; gap:6px; font-size:13px; color:var(--ink-dim);
+    margin:0 0 10px; text-align:left; cursor:pointer;
+  }
+  .lockscreen .showpass input{width:auto; margin:0;}
   .lockscreen button{width:100%; padding:11px; margin-top:4px;}
   .lockscreen .error{text-align:left; margin-top:6px;}
   #appRoot{display:none;}
   .logout-bar{display:flex; justify-content:flex-end; margin-bottom:8px;}
   .logout-bar button{background:none; border:none; color:var(--ink-dim); font-size:13px; cursor:pointer; text-decoration:underline;}
+
+  .banner{
+    display:none; background:var(--clay-dim); color:var(--clay); border:1px solid var(--clay);
+    border-radius:8px; padding:12px 14px; font-size:13.5px; margin-bottom:20px;
+  }
+  .banner button{margin-left:10px; background:none; border:none; color:var(--clay); text-decoration:underline; cursor:pointer; font-size:13.5px;}
 </style>
 </head>
 <body>
 
 <div id="lockscreen" class="lockscreen">
-  <h2 id="lockTitle">Enter password</h2>
-  <p id="lockSub">This app is password-protected.</p>
-  <input id="lockPass" type="password" placeholder="Password">
-  <input id="lockPass2" type="password" placeholder="Confirm password" style="display:none;">
-  <button class="primary" onclick="handleLockSubmit()" id="lockBtn">Unlock</button>
+  <h2 id="lockTitle">Connecting…</h2>
+  <p id="lockSub">Please wait a moment.</p>
+  <input id="lockPass" type="password" placeholder="Password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" style="display:none;">
+  <input id="lockPass2" type="password" placeholder="Confirm password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" style="display:none;">
+  <label class="showpass" id="showPassRow" style="display:none;"><input type="checkbox" id="showPass" onchange="toggleShowPass()"> Show password</label>
+  <button class="primary" id="lockBtn" disabled>Please wait</button>
   <div id="lockError" class="error"></div>
 </div>
 
@@ -111,6 +124,8 @@
   <div class="logout-bar"><button onclick="logout()">Lock app</button></div>
   <h1>Angwa Shanu, Ojepio Sons and Daughters Development Association</h1>
   <p class="sub">Ojoku Ojeje, Anpka, Kogi State — members, contributions, launching pledges and donations in one place.</p>
+
+  <div id="syncBanner" class="banner"></div>
 
   <div class="cards" id="summaryCards"></div>
 
@@ -255,122 +270,211 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 
-// window.storage shim, now backed by Firestore instead of localStorage,
-// so data is shared across every device/browser that opens this site.
+// Storage helper backed by Firestore. Errors are NOT swallowed here:
+// callers must handle a failed read so a bad connection is never mistaken
+// for "no password set" or "no records yet".
 window.storage = {
-  async get(key, shared){
-    try{
-      const doc = await db.collection('app_data').doc(key).get();
-      if(!doc.exists) return null;
-      return { key, value: doc.data().value, shared: true };
-    }catch(e){ console.error('storage.get failed', e); return null; }
+  async get(key){
+    const doc = await db.collection('app_data').doc(key).get();
+    if(!doc.exists) return null;
+    return { key, value: doc.data().value };
   },
-  async set(key, value, shared){
+  async set(key, value){
     await db.collection('app_data').doc(key).set({ value });
-    return { key, value, shared: true };
-  },
-  async delete(key, shared){
-    await db.collection('app_data').doc(key).delete();
-    return { key, deleted: true, shared: true };
-  },
-  async list(prefix, shared){
-    const snap = await db.collection('app_data').get();
-    const keys = snap.docs.map(d=>d.id).filter(k => !prefix || k.startsWith(prefix));
-    return { keys, prefix, shared: true };
+    return { key, value };
   }
 };
 
 let data = { members: [], contributions: [], launching: [], donations: [], meetings: [] };
 let loaded = false;
+let loadFailed = false;
+
+// Escape text before putting it into HTML so names/notes can't inject code.
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
+  ));
+}
+
+/* ---------- Password lock ---------- */
+
+let lockMode = 'login'; // 'login' | 'setup' | 'offline'
 
 async function sha256(text){
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 
-async function initLock(){
-  let rec = null;
-  try{
-    const res = await window.storage.get('association-auth', true);
-    if(res && res.value) rec = JSON.parse(res.value);
-  }catch(e){}
+async function readAuth(){
+  const res = await window.storage.get('association-auth');
+  return (res && res.value) ? JSON.parse(res.value) : null;
+}
 
-  const isSetup = !rec;
+function toggleShowPass(){
+  const type = document.getElementById('showPass').checked ? 'text' : 'password';
+  document.getElementById('lockPass').type = type;
+  document.getElementById('lockPass2').type = type;
+}
+
+function setLockView(mode){
+  lockMode = mode;
   const title = document.getElementById('lockTitle');
   const sub = document.getElementById('lockSub');
+  const pass = document.getElementById('lockPass');
   const pass2 = document.getElementById('lockPass2');
+  const showRow = document.getElementById('showPassRow');
   const btn = document.getElementById('lockBtn');
+  btn.disabled = false;
 
-  if(isSetup){
+  if(mode === 'offline'){
+    title.textContent = "Can't connect";
+    sub.textContent = 'Check your internet connection and try again. Your password and records are safe.';
+    pass.style.display = 'none'; pass2.style.display = 'none'; showRow.style.display = 'none';
+    btn.textContent = 'Try again';
+  } else if(mode === 'setup'){
     title.textContent = 'Set an admin password';
     sub.textContent = 'This is the first time opening this app — choose a password everyone with access will use.';
-    pass2.style.display = 'block';
+    pass.style.display = 'block'; pass2.style.display = 'block'; showRow.style.display = 'flex';
+    pass.autocomplete = 'new-password';
     btn.textContent = 'Set password';
+  } else {
+    title.textContent = 'Enter password';
+    sub.textContent = 'This app is password-protected.';
+    pass.style.display = 'block'; pass2.style.display = 'none'; showRow.style.display = 'flex';
+    pass.autocomplete = 'current-password';
+    btn.textContent = 'Unlock';
   }
-
-  btn.onclick = () => handleLockSubmit(isSetup);
-  document.getElementById('lockPass').addEventListener('keydown', e=>{ if(e.key==='Enter' && !isSetup) handleLockSubmit(isSetup); });
 }
 
-async function handleLockSubmit(isSetup){
+async function initLock(){
+  const btn = document.getElementById('lockBtn');
   const err = document.getElementById('lockError');
-  const pass = document.getElementById('lockPass').value;
   err.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Connecting…';
+  try{
+    const rec = await readAuth();
+    setLockView(rec ? 'login' : 'setup');
+  }catch(e){
+    console.error('Could not read password record', e);
+    setLockView('offline');
+  }
+}
+
+async function handleLockSubmit(){
+  const err = document.getElementById('lockError');
+  const btn = document.getElementById('lockBtn');
+  err.textContent = '';
+
+  if(lockMode === 'offline'){ initLock(); return; }
+
+  const pass = document.getElementById('lockPass').value;
   if(!pass){ err.textContent = 'Enter a password'; return; }
 
-  if(isSetup){
-    const pass2 = document.getElementById('lockPass2').value;
-    if(pass.length < 4){ err.textContent = 'Use at least 4 characters'; return; }
-    if(pass !== pass2){ err.textContent = 'Passwords do not match'; return; }
-    const hash = await sha256(pass);
-    await window.storage.set('association-auth', JSON.stringify({ hash }), true);
-    unlockApp();
-  } else {
-    let rec = null;
-    try{
-      const res = await window.storage.get('association-auth', true);
-      if(res && res.value) rec = JSON.parse(res.value);
-    }catch(e){}
-    const hash = await sha256(pass);
-    if(rec && rec.hash === hash){
+  btn.disabled = true;
+  try{
+    if(lockMode === 'setup'){
+      const pass2 = document.getElementById('lockPass2').value;
+      if(pass.length < 4){ err.textContent = 'Use at least 4 characters'; return; }
+      if(pass !== pass2){ err.textContent = 'Passwords do not match'; return; }
+
+      // Safety check: never overwrite a password that already exists.
+      let existing;
+      try{ existing = await readAuth(); }
+      catch(e){ err.textContent = "Can't connect right now. Check your internet and try again."; return; }
+      if(existing){
+        err.textContent = 'A password has already been set. Reloading…';
+        setTimeout(()=>location.reload(), 1200);
+        return;
+      }
+
+      const hash = await sha256(pass);
+      try{
+        await window.storage.set('association-auth', JSON.stringify({ hash }));
+      }catch(e){
+        console.error(e);
+        err.textContent = 'Could not save the password. Check your internet connection and try again.';
+        return;
+      }
       unlockApp();
     } else {
-      err.textContent = 'Incorrect password';
+      let rec;
+      try{ rec = await readAuth(); }
+      catch(e){ err.textContent = "Can't connect right now. Check your internet and try again."; return; }
+      if(!rec){ initLock(); return; }
+      const hash = await sha256(pass);
+      if(rec.hash === hash){
+        unlockApp();
+      } else {
+        err.textContent = 'Incorrect password. Check for extra spaces or capital letters.';
+      }
     }
+  } finally {
+    btn.disabled = false;
   }
 }
+
+document.getElementById('lockBtn').onclick = handleLockSubmit;
+['lockPass','lockPass2'].forEach(id=>{
+  document.getElementById(id).addEventListener('keydown', e=>{
+    if(e.key === 'Enter') handleLockSubmit();
+  });
+});
 
 function unlockApp(){
   document.getElementById('lockscreen').style.display = 'none';
   document.getElementById('appRoot').style.display = 'block';
-  sessionStorageFlag(true);
+  document.getElementById('lockPass').value = '';
+  document.getElementById('lockPass2').value = '';
   if(!loaded) loadData();
 }
 
 function logout(){
   document.getElementById('appRoot').style.display = 'none';
   document.getElementById('lockscreen').style.display = 'block';
-  document.getElementById('lockPass').value = '';
-  sessionStorageFlag(false);
+  document.getElementById('showPass').checked = false;
+  toggleShowPass();
+  initLock();
 }
 
-let unlockedThisSession = false;
-function sessionStorageFlag(val){ unlockedThisSession = val; }
+/* ---------- Loading and saving records ---------- */
+
+function showBanner(msg){
+  const b = document.getElementById('syncBanner');
+  if(!msg){ b.style.display = 'none'; b.textContent = ''; return; }
+  b.innerHTML = esc(msg) + '<button onclick="location.reload()">Reload page</button>';
+  b.style.display = 'block';
+}
 
 async function loadData(){
   try{
-    const res = await window.storage.get('association-data', true);
+    const res = await window.storage.get('association-data');
     if(res && res.value){ data = JSON.parse(res.value); }
-  }catch(e){}
-  if(!data.meetings) data.meetings = [];
-  loaded = true;
+    loadFailed = false;
+    showBanner('');
+  }catch(e){
+    console.error('Load failed', e);
+    loadFailed = true;
+    showBanner("Couldn't load your saved records. Nothing will be saved until this is fixed, so please don't add anything yet.");
+  }
+  ['members','contributions','launching','donations','meetings'].forEach(k=>{ if(!Array.isArray(data[k])) data[k] = []; });
+  loaded = !loadFailed;
   renderAll();
 }
 
 async function saveData(){
+  // Never save after a failed load: that could replace real records with an empty list.
+  if(loadFailed){
+    showBanner("Couldn't load your saved records, so this change was not saved. Please reload the page.");
+    return;
+  }
   try{
-    await window.storage.set('association-data', JSON.stringify(data), true);
-  }catch(e){ console.error('Save failed', e); }
+    await window.storage.set('association-data', JSON.stringify(data));
+    showBanner('');
+  }catch(e){
+    console.error('Save failed', e);
+    showBanner("This change could not be saved. Check your internet connection, then reload the page and add it again.");
+  }
 }
 
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
@@ -381,6 +485,8 @@ function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id===name));
 }
 document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click', ()=>switchTab(t.dataset.tab)));
+
+/* ---------- Members ---------- */
 
 function addMember(){
   const name = document.getElementById('mName').value.trim();
@@ -401,6 +507,8 @@ function removeMember(id){
   data.contributions = data.contributions.filter(c=>c.memberId!==id);
   saveData(); renderAll();
 }
+
+/* ---------- Contributions ---------- */
 
 function addContribution(){
   const memberId = document.getElementById('cMember').value;
@@ -431,6 +539,8 @@ function removeContribution(id){
   saveData(); renderAll();
 }
 
+/* ---------- Launching ---------- */
+
 function addLaunching(){
   const name = document.getElementById('lName').value.trim();
   const pledged = document.getElementById('lPledged').value;
@@ -449,6 +559,8 @@ function removeLaunching(id){
   data.launching = data.launching.filter(l=>l.id!==id);
   saveData(); renderAll();
 }
+
+/* ---------- Donations ---------- */
 
 function addDonation(){
   const name = document.getElementById('dName').value.trim();
@@ -472,6 +584,8 @@ function removeDonation(id){
   saveData(); renderAll();
 }
 
+/* ---------- Meetings ---------- */
+
 function addMeeting(){
   const date = document.getElementById('meetDate').value;
   const time = document.getElementById('meetTime').value;
@@ -494,6 +608,8 @@ function removeMeeting(id){
   saveData(); renderAll();
 }
 
+/* ---------- Rendering ---------- */
+
 function memberName(id){
   const m = data.members.find(x=>x.id===id);
   return m ? m.name : 'Unknown';
@@ -503,7 +619,7 @@ function renderMembers(){
   const el = document.getElementById('membersTable');
   const sel = document.getElementById('cMember');
   sel.innerHTML = '<option value="">Select member</option>' +
-    data.members.map(m=>`<option value="${m.id}">${m.name}</option>`).join('');
+    data.members.map(m=>`<option value="${m.id}">${esc(m.name)}</option>`).join('');
 
   if(data.members.length===0){
     el.innerHTML = '<div class="empty">No members yet. Add your first member above.</div>';
@@ -512,7 +628,7 @@ function renderMembers(){
   el.innerHTML = `<table><thead><tr><th>Name</th><th>Phone</th><th>Registration fee</th><th>Total contributed</th><th></th></tr></thead><tbody>` +
     data.members.map(m=>{
       const total = data.contributions.filter(c=>c.memberId===m.id).reduce((s,c)=>s+c.amount,0);
-      return `<tr><td>${m.name}</td><td>${m.phone||'—'}</td><td>${money(m.regFee)}</td><td>${money(total)}</td><td><button class="del" onclick="removeMember('${m.id}')">Remove</button></td></tr>`;
+      return `<tr><td>${esc(m.name)}</td><td>${esc(m.phone)||'—'}</td><td>${money(m.regFee)}</td><td>${money(total)}</td><td><button class="del" onclick="removeMember('${m.id}')">Remove</button></td></tr>`;
     }).join('') + `</tbody></table>`;
 }
 
@@ -541,7 +657,7 @@ function renderContributionGrid(){
     MONTHS.map(m=>`<th>${m}</th>`).join('') + `<th>Total</th></tr></thead><tbody>`;
   data.members.forEach(m=>{
     let rowTotal = 0;
-    html += `<tr><td>${m.name}</td>`;
+    html += `<tr><td>${esc(m.name)}</td>`;
     MONTHS.forEach((mn, idx)=>{
       const monthStr = `${year}-${String(idx+1).padStart(2,'0')}`;
       const paid = data.contributions.some(c=>c.memberId===m.id && c.month===monthStr);
@@ -564,7 +680,7 @@ function renderContributions(){
   }
   const rows = [...data.contributions].sort((a,b)=> b.month.localeCompare(a.month));
   el.innerHTML = `<table><thead><tr><th>Member</th><th>Month</th><th>Amount</th><th></th></tr></thead><tbody>` +
-    rows.map(c=>`<tr><td>${memberName(c.memberId)}</td><td>${c.month}</td><td>${money(c.amount)}</td><td><button class="del" onclick="removeContribution('${c.id}')">Remove</button></td></tr>`).join('') +
+    rows.map(c=>`<tr><td>${esc(memberName(c.memberId))}</td><td>${esc(c.month)}</td><td>${money(c.amount)}</td><td><button class="del" onclick="removeContribution('${c.id}')">Remove</button></td></tr>`).join('') +
     `</tbody></table>`;
 }
 
@@ -579,7 +695,7 @@ function renderLaunching(){
       const status = l.paid >= l.pledged && l.pledged>0
         ? '<span class="tag green">Fulfilled</span>'
         : l.paid > 0 ? '<span class="tag amber">Partial</span>' : '<span class="tag clay">Pending</span>';
-      return `<tr><td>${l.name}</td><td>${money(l.pledged)}</td><td>${money(l.paid)}</td><td>${status}</td><td><button class="del" onclick="removeLaunching('${l.id}')">Remove</button></td></tr>`;
+      return `<tr><td>${esc(l.name)}</td><td>${money(l.pledged)}</td><td>${money(l.paid)}</td><td>${status}</td><td><button class="del" onclick="removeLaunching('${l.id}')">Remove</button></td></tr>`;
     }).join('') + `</tbody></table>`;
 }
 
@@ -591,7 +707,7 @@ function renderDonations(){
   }
   const rows = [...data.donations].sort((a,b)=> b.date.localeCompare(a.date));
   el.innerHTML = `<table><thead><tr><th>Donor</th><th>Amount</th><th>Purpose</th><th>Date</th><th></th></tr></thead><tbody>` +
-    rows.map(d=>`<tr><td>${d.name}</td><td>${money(d.amount)}</td><td>${d.purpose||'—'}</td><td>${d.date}</td><td><button class="del" onclick="removeDonation('${d.id}')">Remove</button></td></tr>`).join('') +
+    rows.map(d=>`<tr><td>${esc(d.name)}</td><td>${money(d.amount)}</td><td>${esc(d.purpose)||'—'}</td><td>${esc(d.date)}</td><td><button class="del" onclick="removeDonation('${d.id}')">Remove</button></td></tr>`).join('') +
     `</tbody></table>`;
 }
 
@@ -606,7 +722,7 @@ function renderMeetings(){
   el.innerHTML = `<table><thead><tr><th>Date</th><th>Time</th><th>Venue</th><th>Agenda</th><th></th></tr></thead><tbody>` +
     rows.map(m=>{
       const past = m.date < today;
-      return `<tr${past ? ' style="opacity:0.55;"' : ''}><td>${m.date}${!past ? ' <span class="tag green">Upcoming</span>' : ''}</td><td>${m.time || '—'}</td><td>${m.venue}</td><td>${m.agenda || '—'}</td><td><button class="del" onclick="removeMeeting('${m.id}')">Remove</button></td></tr>`;
+      return `<tr${past ? ' style="opacity:0.55;"' : ''}><td>${esc(m.date)}${!past ? ' <span class="tag green">Upcoming</span>' : ''}</td><td>${esc(m.time) || '—'}</td><td>${esc(m.venue)}</td><td>${esc(m.agenda) || '—'}</td><td><button class="del" onclick="removeMeeting('${m.id}')">Remove</button></td></tr>`;
     }).join('') + `</tbody></table>`;
 }
 
@@ -624,7 +740,7 @@ function renderSummary(){
     ['Monthly contributions', money(totalContrib)],
     ['Launching raised', money(totalLaunching)],
     ['Donations', money(totalDonations)],
-    ['Next meeting', upcoming ? upcoming.date : '—'],
+    ['Next meeting', upcoming ? esc(upcoming.date) : '—'],
   ];
   document.getElementById('summaryCards').innerHTML = cards.map(([label,value])=>
     `<div class="card"><p class="label">${label}</p><p class="value">${value}</p></div>`
